@@ -70,56 +70,72 @@ def update_and_save_memory(user_id: str, chain):
     save_memory(user_id, messages)
 
 # 💡 這裡開始是修改後的函式
-def display_trip_by_trip_id(trip_id: str) -> str:
+def display_trip_by_trip_id(trip_id: ObjectId) -> str:
     """
-    根據新的鏈結串列資料結構，將行程資料轉換為文字格式。
+    根據新的 nodes 資料結構，將行程資料轉換為文字格式。
     """
-    trip = trips_collection.find_one({"trip_id": trip_id})
+    trip = trips_collection.find_one({"_id": trip_id})
+
     if not trip:
         return "❌ 查無行程"
 
     days = trip.get("days", [])
+    nodes = trip.get("nodes", [])
+    
     if not days:
         return "❌ 查無行程 (無任何天數安排)"
+    
+    if not nodes:
+        return "❌ 查無行程 (無任何 nodes)"
+
+    # 建立一個 node_id 到 node 物件的對應字典，方便快速查找
+    nodes_map = {node.get("node_id"): node for node in nodes}
 
     result = (
         f"📌 行程名稱：{trip.get('title', '未命名')}\n"
-        f"📅 日期：{trip.get('startDate')} 至 {trip.get('endDate')}\n"
-        f"💰 預算：{trip.get('budget')} 元\n"
-        f"📝 描述：{trip.get('description')}\n\n"
+        f"📅 日期：{trip.get('start_date')} 至 {trip.get('end_date')}\n"
+        f"💰 預算：{trip.get('total_budget', 'N/A')} 元\n"
         f"📍 每日行程安排：\n"
     )
 
     for day_data in days:
         day_number = day_data.get("day")
-        head_id = day_data.get("head")
-        attractions_list = day_data.get("attractions", [])
+        date = day_data.get("date", "")
+        city = day_data.get("city", "")
+        head_id = day_data.get("head_id")
 
-        # 建立一個 ID 到景點物件的對應字典，方便快速查找
-        attractions_map = {attr.get("_id"): attr for attr in attractions_list}
-
-        result += f"=== Day {day_number} ===\n"
+        result += f"\n=== Day {day_number} ({date}) - {city} ===\n"
 
         if not head_id:
             result += "無排程\n"
             continue
 
+        # 根據 head_id 開始遍歷該天的 nodes
         current_id = head_id
         while current_id:
-            current_attraction = attractions_map.get(current_id)
-            if not current_attraction:
-                result += f"⚠️ 連結錯誤：找不到 ID 為 {current_id} 的景點\n"
+            current_node = nodes_map.get(current_id)
+            if not current_node:
+                result += f"⚠️ 連結錯誤：找不到 ID 為 {current_id} 的 node\n"
                 break
 
-            name = current_attraction.get("name", "未填活動")
-            start_time = current_attraction.get("start_time", "??:??")
-            end_time = current_attraction.get("end_time", "??:??")
-            note = current_attraction.get("note", "")
+            slot = current_node.get("slot", "")
+            start_time = current_node.get("start", "??:??")
+            end_time = current_node.get("end", "??:??")
+            places = current_node.get("places", [])
 
-            result += f"{start_time}~{end_time} - {name} {f'📝{note}' if note else ''}\n"
+            result += f"{start_time}~{end_time} ({slot})\n"
 
-            # 移動到下一個節點
-            current_id = current_attraction.get("next_id")
+            # 顯示該 slot 的所有地點
+            for place in places:
+                name = place.get("name", "未填活動")
+                category = place.get("category", "")
+                stay_minutes = place.get("stay_minutes", 0)
+
+                result += f"  • {name} ({category})\n"
+                result += f" ⏱️ {stay_minutes}分鐘\n"
+
+            # 移動到下一個 node
+            current_id = current_node.get("next_id")
 
     return result.strip()
 
@@ -312,10 +328,9 @@ JSON 必須包含在 ```json 和 ``` 之間。
 
         # 呼叫 Gemini 進行分析
         from langchain_google_genai import ChatGoogleGenerativeAI
-        analysis_llm = ChatGoogleGenerativeAI(
-            model="gemini-1.5-flash", 
-            model_kwargs={"location": "us-central1"},
-            temperature=0.2
+        analysis_llm = ChatOpenAI(
+            model="gpt-4o-mini",  # ✅
+            api_key=os.getenv("OPENAI_API_KEY")
         )
         response = analysis_llm.invoke(prompt).content
         print("📩 Gemini 回應原始文字：\n", response)

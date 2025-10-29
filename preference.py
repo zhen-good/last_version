@@ -75,10 +75,12 @@ def load_preferences_by_trip_id(trip_id: str) -> dict:
     回傳格式：{"prefer": [...], "avoid": [...]}
     """
     from mongodb_utils import trips_collection
-    
+
+    trip_id = ObjectId(trip_id) #因為前面抓的方法好像是string，所以要轉一下型態
+
     try:
         # 先找到該行程的所有成員
-        trip = trips_collection.find_one({"trip_id": trip_id})
+        trip = trips_collection.find_one({"_id": trip_id})
         if not trip:
             print(f"❌ 找不到 trip_id: {trip_id} 的行程")
             return {"prefer": [], "avoid": []}
@@ -241,3 +243,6 @@ def update_user_preferences(
         import traceback
         traceback.print_exc()
         return {"prefer": [], "avoid": []}
+    
+
+

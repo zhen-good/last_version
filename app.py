@@ -1,12 +1,13 @@
 # app.py
 from dotenv import find_dotenv, load_dotenv
-
 from chat_nature import coerce_to_json_dict, handle_extra_chat
 from place_gmaps import search_candidates
 from place_node import _anchor_coords
-
+from datetime import datetime, timedelta
+from bson import ObjectId,json_util
+import jwt
+from flask import jsonify, request
 import json
-from bson import json_util
 import re
 from threading import Thread
 import traceback
@@ -14,11 +15,13 @@ from flask import Flask, render_template, request, jsonify, session
 from flask_socketio import SocketIO, emit, join_room
 from bson import ObjectId
 import bcrypt, string, random, os
-from datetime import datetime
+
+
 
 # 🔧 工具與模組
 from chat_manager import (
     decide_location_placement,
+    display_trip_by_trip_id,
     get_user_chain,
     update_and_save_memory,
     analyze_active_users_preferences,
@@ -30,6 +33,7 @@ from convert_trip import convert_trip_to_prompt
 from optimizer import summarize_recommendations, ask_to_add_place, suggest_trip_modifications
 from place_util import get_opening_hours, search_places_by_tag
 from preference import update_user_preferences, extract_preferences_from_text
+from register_util import make_token, to_user_dto
 from weather_utils import get_weather, CITY_TRANSLATIONS
 from mongodb_utils import (
     user_collection,
@@ -37,7 +41,8 @@ from mongodb_utils import (
     get_trip_by_id,
     add_to_itinerary,
     delete_from_itinerary,
-    modify_itinerary
+    modify_itinerary,
+    save_message_to_mongodb #將題目存進mongodb
 )
 
 
@@ -79,16 +84,15 @@ pending_recommendations = {}
 
 
 
-# ---------- 🔒 Auth Routes ----------
+# ---------- 註冊、登入 ----------
+
 @app.route("/")
 def register_page():
     return render_template("register.html")
 
-
 @app.route("/login_page")
 def login_page():
     return render_template("login.html")
-
 
 @app.route("/register", methods=["POST"])
 def register():
@@ -104,38 +108,15 @@ def register():
     return jsonify({"message": "註冊成功"})
 
 
-from datetime import datetime, timedelta
-from bson import ObjectId
-import jwt
-from flask import jsonify, request
-
-JWT_SECRET = "replace_me_with_a_strong_secret"
-JWT_ALG = "HS256"
-JWT_EXPIRE_MIN = 7  # days
-
-def make_token(user_id: str):
-    now = datetime.utcnow()
-    payload = {
-        "sub": user_id,
-        "iat": now,
-        "exp": now + timedelta(days=JWT_EXPIRE_MIN),
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
-
-def to_user_dto(user_doc: dict):
-    return {
-        "_id": str(user_doc["_id"]),
-        "username": user_doc.get("username") or user_doc.get("name") or "",
-        "email": user_doc.get("email") or "",
-    }
-
 @app.route("/login", methods=["POST"])
 def login():
+
+    #這邊是在獲取前端的數據
     data = request.get_json(force=True) or {}
     email = data.get("email", "").strip()
     password = data.get("password", "")
-
     user = user_collection.find_one({"email": email})
+
     if not user or not bcrypt.checkpw(password.encode(), user["password"]):
         # 與前端慣例一致：401 + { "detail": "..." }
         return jsonify({"detail": "帳號或密碼錯誤"}), 401
@@ -166,7 +147,7 @@ def create_trip():
         return jsonify({"error": "缺少主揪資訊"}), 400
 
     trip_id = generate_trip_id()
-    while trips_collection.find_one({"trip_id": trip_id}):
+    while trips_collection.find_one({"_id": trip_id}):
         trip_id = generate_trip_id()
 
     # 💡 將新生成的 trip_id 存入 creator 的使用者文件中
@@ -211,13 +192,21 @@ def handle_join(data):
     user_id = data.get("user_id")
     trip_id = data.get("trip_id")
     user_name = data.get("name")
+
+    trip_id_ob = ObjectId(trip_id)
+
     session["user_id"] = user_id
     session["trip_id"] = trip_id
+
     join_room(trip_id)
-    emit("chat_message", {"user_id": "系統", "message": f"{user_id} 已加入聊天室"}, room=trip_id)
-    doc = trips_collection.find_one({"trip_id": trip_id}, {"_id": 0, "nodes": 1})
-    nodes = (doc or {}).get("nodes", [])  # 沒有就給空陣列
-    emit("trip", {"nodes": nodes}, room=trip_id)
+
+    emit("chat_message", {"user_id": "系統", "message": f"{user_id} 已加入聊天室 {trip_id}"}, room=trip_id)
+
+    
+    # doc = trips_collection.find_one({"_id": trip_id_ob}, {"_id": 0, "nodes": 1})
+    #這邊是一開始會先傳一個trip的行程給使用者看
+    trip_text = display_trip_by_trip_id(trip_id_ob)
+    emit("trip", {"user_id": "系統", "message": trip_text}, room=trip_id)
     emit("chat_message", {"user_id": "系統", "message": f"請跟我說說你對本次行程的看法吧~"}, room=trip_id)
 
 
@@ -233,12 +222,12 @@ def handle_user_message(data):
     if not user_id or not trip_id:
         return
     
-    from mongodb_utils import save_message_to_mongodb
     save_message_to_mongodb(trip_id,user_id, "user", raw_message)
+
+    trip_id_ob = ObjectId(trip_id)
     
-    # emit("chat_message", {"user_id": user_id, "message": raw_message}, room=trip_id)
     try:
-        # 2. 發送給前端 ❓ 有這行嗎?
+        # 2. 發送給前端
         emit("chat_message", {
             "user_id": user_id,
             "message": raw_message
@@ -249,8 +238,6 @@ def handle_user_message(data):
     
     # 呼叫你的 GPT 產生單題輸出
     out = handle_extra_chat(user_id, trip_id, raw_message)  # 應回上面的單題 dict
-
-
 
     print("確認題目格式：", out)
 
@@ -266,29 +253,23 @@ def handle_user_message(data):
     reject_keywords = {"否", "略過", "不要", "取消"}
 
     
-
     # 🔎 特殊指令：查看行程
     if raw_message in {"行程", "我的行程", "查看行程"}:
         try:
             # 這裡用你已從 mongodb_utils 匯入的 trips_collection
             # 其實就是 db["structured_itineraries"]
-            doc = trips_collection.find_one({"trip_id": trip_id}, {"_id": 0, "nodes": 1})
+            doc = trips_collection.find_one({"_id": trip_id_ob}, {"_id": 0, "nodes": 1})
             nodes = (doc or {}).get("nodes", [])  # 沒有就給空陣列
 
             if not nodes:
                 emit("ai_response", {"message": "❗ 找不到此行程（trip_id 不存在或已被刪除）。"}, room=trip_id)
                 return
 
-            # 轉成可傳輸格式
-            nodes = json.loads(json_util.dumps(nodes))  # 轉成純 JSON
-            print(nodes)
-
-            # ✅ 透過 Socket 傳給前端
-            # 事件名 "trip" 可由你前端自由監聽（e.g., socket.on('trip', ...)）
-            emit("trip", {"nodes": nodes}, room=trip_id)
-
+            trip_text = display_trip_by_trip_id(trip_id_ob)
+            emit("trip", {"user_id": "系統", "message": trip_text}, room=trip_id)
             # 同時給一個人性化訊息
             emit("ai_response", {"message": "🧭 已送出目前行程資訊到畫面。"}, room=trip_id)
+
         except Exception as e:
             traceback.print_exc()
             emit("ai_response", {"message": f"❗ 讀取行程時發生錯誤：{e}"}, room=trip_id)
@@ -371,47 +352,85 @@ def handle_user_message(data):
 
         # 處理 modify 建議的回覆
         if current_rec["type"] == "modify":
+            # 💡 關鍵修正一：統一使用 AI 輸出的 'place' 鍵名 (假設已在其他地方修正了 AI 的 JSON)
+            original_place_name = current_rec.get('place') 
+            original_place_id = current_rec.get('place_id') # 假設您也儲存了原始地點的 ID
+            
             suggested_places = current_rec.get('new_places', [])
             
-            # 檢查使用者是否選擇了其中一個替代景點
             user_choice = None
-
-            for cand in suggested_places:
-                # cand 可能是 dict 或 str；都轉成可以比的字串
-                if isinstance(cand, dict):
-                    name = str(cand.get("name", "")).lower()
-                else:
-                    name = str(cand).lower()
-
-                if raw_message == name or raw_message in name or name in raw_message:
-                    user_choice = cand   # 保留原物件（如果是 dict，後面可取 place_id）
-                    break
             
+            # --- 新增的邏輯：檢查是否為數字編號回覆 ---
+            try:
+                choice_index = int(raw_message) - 1
+                if 0 <= choice_index < len(suggested_places):
+                    user_choice = suggested_places[choice_index]
+            except ValueError:
+                # 如果不是數字，則執行原本的邏輯：檢查是否為地點名稱或關鍵字
+                pass 
+                
+            # --- 保留原本的邏輯：檢查是否為地點名稱 (數字回覆優先處理) ---
+            if not user_choice:
+                # 檢查使用者是否選擇了其中一個替代景點（用名稱比對）
+                for cand in suggested_places:
+                    # cand 可能是 dict 或 str；都轉成可以比的字串
+                    if isinstance(cand, dict):
+                        name = str(cand.get("name", "")).lower()
+                    else:
+                        name = str(cand).lower()
+
+                    if raw_message.lower() == name or raw_message.lower() in name or name in raw_message.lower():
+                        user_choice = cand  # 保留原物件（如果是 dict，後面可取 place_id）
+                        break
+            
+            # --- 處理「略過」回覆 ---
+            if raw_message.lower() in ("略過", "skip", "pass"):
+                emit("ai_response", {
+                    "message": f"✅ 已略過 Day{current_rec['day']} 對「{original_place_name}」的修改建議。"
+                }, room=trip_id)
+                # 🚨 關鍵修正：移除已處理的建議 (略過)
+                recommendations.pop(0)
+                # 💡 檢查並發送下一個建議 (與下方成功邏輯相同)
+                if recommendations:
+                    next_rec = recommendations[0]
+                    # 💡 注意：這裡需要您提供 generate_recommendation_prompt 函式的實現
+                    next_prompt = generate_recommendation_prompt(next_rec) 
+                    emit("ai_response", {"message": next_prompt}, room=trip_id)
+                else:
+                    pending_recommendations.pop(user_id)
+                    emit("ai_response", {"message": "✅ 所有建議已處理完畢。"}, room=trip_id)
+                return # 處理完畢，結束函式
+
+            # --- 處理成功的選擇 (數字或名稱) ---
             if user_choice:
                 try:
-                    # 💡 關鍵修正：實際呼叫資料庫修改函式並檢查結果
-                    print(f"🔧 嘗試修改：trip_id={trip_id}, day={current_rec['day']}, old_place={current_rec['ori_place']}, new_place={user_choice}")
+                    # 💡 關鍵修正：確保使用正確的鍵名
+                    print(f"🔧 嘗試修改：trip_id={trip_id}, day={current_rec['day']}, old_place={original_place_name}, new_place={user_choice}")
                     
-                    success = modify_itinerary(trip_id, current_rec["day"],current_rec["ori_place_id"], user_choice)
+                    # 💡 關鍵修正：使用您實際儲存的原始地點 ID
+                    success = modify_itinerary(trip_id, current_rec["day"], original_place_id, user_choice) 
+                    
+                    # ... (後續的 success/fail 判斷和發送訊息邏輯保持不變) ...
                     
                     if success:
                         emit("ai_response", {
-                            "message": f"✅ 已將 Day{current_rec['day']} 的「{current_rec['ori_place']}」修改為「{user_choice}」。"
+                            "message": f"✅ 已將 Day{current_rec['day']} 的「{original_place_name}」修改為「{user_choice}」。"
                         }, room=trip_id)
-                        print(f"✅ 資料庫修改成功：{current_rec['ori_place']} -> {user_choice}")
+                        print(f"✅ 資料庫修改成功：{original_place_name} -> {user_choice}")
                     else:
                         emit("ai_response", {
-                            "message": f"❗ 修改「{current_rec['ori_place']}」為「{user_choice}」時發生錯誤，請再試一次。"
+                            "message": f"❗ 修改「{original_place_name}」為「{user_choice}」時發生錯誤，請再試一次。"
                         }, room=trip_id)
-                        print(f"❌ 資料庫修改失敗：{current_rec['ori_place']} -> {user_choice}")
-                    
+                        print(f"❌ 資料庫修改失敗：{original_place_name} -> {user_choice}")
+                        
                     # 🚨 關鍵修正：移除已處理的建議
                     recommendations.pop(0)
                     
                     # 檢查是否還有其他建議
                     if recommendations:
                         next_rec = recommendations[0]
-                        next_prompt = generate_recommendation_prompt(next_rec)
+                        # 💡 注意：這裡需要您提供 generate_recommendation_prompt 函式的實現
+                        next_prompt = generate_recommendation_prompt(next_rec) 
                         emit("ai_response", {"message": next_prompt}, room=trip_id)
                     else:
                         # 🚨 關鍵修正：所有建議處理完畢，清空 pending 狀態
@@ -419,36 +438,20 @@ def handle_user_message(data):
                         emit("ai_response", {"message": "✅ 所有建議已處理完畢。"}, room=trip_id)
                         
                 except Exception as e:
-                    traceback.print_exc()
-                    emit("ai_response", {"message": f"❗ 處理建議時發生錯誤：{e}"}, room=trip_id)
-                    print(f"❌ 修改行程時發生例外：{e}")
-                return  # 🚨 重要：處理完就直接返回
-
-            elif raw_message in reject_keywords:
-                emit("ai_response", {"message": "👌 已略過此建議。"}, room=trip_id)
-                
-                # 🚨 關鍵修正：移除已處理的建議
-                recommendations.pop(0)
-                
-                if recommendations:
-                    next_rec = recommendations[0]
-                    next_prompt = generate_recommendation_prompt(next_rec)
-                    emit("ai_response", {"message": next_prompt}, room=trip_id)
-                else:
-                    # 🚨 關鍵修正：所有建議處理完畢，清空 pending 狀態
-                    pending_recommendations.pop(user_id)
-                    emit("ai_response", {"message": "✅ 所有建議已處理完畢。"}, room=trip_id)
-                return  # 🚨 重要：處理完就直接返回
+                    # 處理例外情況
+                    print(f"❌ 處理修改建議時發生錯誤: {e}")
+                    emit("ai_response", {"message": f"伺服器錯誤：無法處理您的選擇。錯誤：{e}"}, room=trip_id)
+                    
             else:
-                # 用戶回覆不明確，重新提示
-                places_list = "、".join([f"{i+1}. {place}" for i, place in enumerate(suggested_places)])
-                prompt_text = (
-                    f"🤔 請從以下選項中選擇一個來替換「{current_rec['ori_place']}」：\n"
-                    f"{places_list}\n"
-                    f"請直接回覆景點名稱，或回覆「略過」跳過此建議。"
-                )
-                emit("ai_response", {"message": prompt_text}, room=trip_id)
-                return  # 🚨 重要：處理完就直接返回
+                # 處理無效回覆
+                # 💡 關鍵修正二：給出帶有按鈕提示的回覆
+                # 這裡假設您的 `generate_recommendation_prompt` 會生成一個包含按鈕的完整訊息
+                
+                # 重新發送建議，提示使用者點擊按鈕或輸入正確的數字
+                next_prompt = generate_recommendation_prompt(current_rec)
+                emit("ai_response", {"message": "⚠️ 無效的選擇，請點擊按鈕或回覆數字編號 (如: 1) 或 略過。"}, room=trip_id)
+                # 重新發送建議的 UI（發送 `ai_response` 事件，**內含 `buttons` 結構**，這是前端渲染按鈕的關鍵）
+                emit_ai_response_with_buttons(trip_id, current_rec)
 
         # 處理 add 或 delete 建議的回覆
         elif current_rec["type"] in ["add", "delete"]:
@@ -467,9 +470,9 @@ def handle_user_message(data):
                         # 💡 實際呼叫資料庫新增函式
                         success = add_to_itinerary(trip_id, current_rec["day"], "??:??", "??:??", current_rec["ori_place"], after_place=None)
                         if success:
-                            emit("ai_response", {"message": f"✅ 已將「{current_rec['ori_place']}」新增到 Day{current_rec['day']}。"}, room=trip_id)
+                            emit("ai_response", {"message": f"✅ 已將「{current_rec['place']}」新增到 Day{current_rec['day']}。"}, room=trip_id)
                         else:
-                            emit("ai_response", {"message": f"❗ 新增「{current_rec['ori_place']}」時發生錯誤。"}, room=trip_id)
+                            emit("ai_response", {"message": f"❗ 新增「{current_rec['place']}」時發生錯誤。"}, room=trip_id)
 
                     # 💡 只有在操作成功時才繼續下一個建議
                     if success:
@@ -507,8 +510,10 @@ def handle_user_message(data):
                 return  # 🚨 重要：處理完就直接返回
 
     # 3. 特殊指令：分析 or 更換
+
     if raw_message in {"分析", "更換"}:
         try:
+            print("找一下trip_id",trip_id)
             # 🚨 關鍵修正：在開始新的分析前，清空所有 pending 狀態
             if user_id in pending_recommendations:
                 pending_recommendations.pop(user_id)
@@ -516,13 +521,41 @@ def handle_user_message(data):
                 pending_add_location.pop(user_id)
                 
             recommendations_list = analyze_active_users_preferences(user_chains, trip_id)
+            
             if recommendations_list:
                 pending_recommendations[user_id] = recommendations_list
                 first_rec = recommendations_list[0]
-                first_prompt = generate_recommendation_prompt(first_rec)
-                emit("ai_response", {"message": first_prompt}, room=trip_id)
+                
+                # 💡 關鍵修正：判斷是否為 modify 建議，並使用 emit_ai_response_with_buttons
+                if first_rec.get('type') == 'modify':
+                    # 🚀 使用新函式發送，內含 buttons
+                    emit_ai_response_with_buttons(trip_id, first_rec)
+                    print("有發出button嗎")
+                else:
+                    # 處理非 modify 建議 (add/delete)，發送不含 buttons 的結構化數據
+                    
+                    # 1. 生成 AI 提示文本
+                    first_prompt = generate_recommendation_prompt(first_rec)
+                    
+                    # 2. 構建包含結構化數據的 Payload (不含 buttons)
+                    payload = {
+                        "message": first_prompt,
+                        # 🚨 整合結構化數據
+                        "recommendation": {
+                            "type": first_rec['type'],
+                            "day": first_rec['day'],
+                            "place": first_rec['place'],
+                            "reason": first_rec['reason'],
+                            # 只有 modify 建議需要 new_places 列表 (但這裡還是放著，讓前端DTO保持一致)
+                            "new_places": first_rec.get('new_places', []) 
+                        }
+                    }
+                    
+                    # 3. 發送 (只含文字和 recommendation)
+                    emit("ai_response", payload, room=trip_id)
             else:
                 emit("ai_response", {"message": "👌 我已仔細評估過您的行程，目前看來規劃得非常符合您的偏好，沒有需要修改的地方！"}, room=trip_id)
+                
         except Exception as e:
             traceback.print_exc()
             emit("ai_response", {"message": f"❗ 分析與優化失敗：{e}"}, room=trip_id)
@@ -709,7 +742,7 @@ def generate_recommendation_prompt(recommendation: dict) -> str:
 
 
 
-#送題目給前端
+#送題目(自然語言)給前端
 def emit_reply_and_question(user_id: str, trip_id: str, data):
     # 允許字串，轉 dict
     if not isinstance(data, dict):
@@ -751,14 +784,46 @@ def emit_reply_and_question(user_id: str, trip_id: str, data):
         print("[EMIT] ai_question_v2 sent to room:", trip_id)
 
 
-        # 可選：包信封（前端也支援）
-        # envelope = {"user_id": "系統", "message": v2_payload}
-        # socketio.emit("ai_question_v2", envelope, room=trip_id)
-
+# 💡 【新增函式】將推薦建議轉為包含 buttons 結構的 payload
+#     讓前端可以渲染可點擊的按鈕
+def emit_ai_response_with_buttons(trip_id, recommendation_data):
+    """
+    根據 modify 建議的資料，構建包含 message, recommendation 和 buttons 的 payload，
+    並發送 ai_response 事件。
+    """
+    new_places = recommendation_data.get('new_places', [])
+    buttons = []
     
+    # 構建替代地點的按鈕
+    # 限制最多只顯示 5 個選項，與 generate_recommendation_prompt 保持一致
+    for i, place_name in enumerate(new_places[:5]):
+        # 標籤顯示編號和名稱
+        # ⚠️ 注意：這裡假設 place_name 是字串。如果它是字典，需要調整 _present_place_for_prompt 的行為
+        if isinstance(place_name, dict):
+             # 僅使用名稱作為按鈕標籤
+             label = f"{i+1}. {place_name.get('name', '替代地點')}"
+        else:
+             label = f"{i+1}. {place_name}"
+             
+        # 值為編號，與 handle_user_message 中 int(raw_message) - 1 的邏輯對應
+        value = str(i + 1)
+        buttons.append({"label": label, "value": value})
+        
+    # 加入「略過」按鈕
+    buttons.append({"label": "略過", "value": "略過"})
+    
+    # 使用現有的函式生成純文字提示
+    text_message = generate_recommendation_prompt(recommendation_data)
 
-
-
+    payload = {
+        "message": text_message, # 純文字提示（包含建議與替代選項列表）
+        "recommendation": recommendation_data,
+        "buttons": buttons      # 讓前端渲染按鈕
+    }
+    
+    # 透過 socket.io 發送事件
+    socketio.emit("ai_response", payload, room=trip_id)
+    print(f"✅ EMIT ai_response with {len(buttons)} buttons for modify recommendation.")
 
 # ---------- 🚀 Run ----------
 if __name__ == "__main__":

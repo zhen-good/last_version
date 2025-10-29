@@ -3,6 +3,8 @@ import json
 import re
 import traceback
 
+from bson import ObjectId
+
 def extract_json(text: str):
     """
     從文字中抽取第一個合法 JSON 區塊，並轉成 Python 物件 (dict 或 list) 回傳。
@@ -41,3 +43,7 @@ def extract_json(text: str):
 
     print("❌ 所有 JSON 提取嘗試均失敗。")
     return None
+
+
+def object_id_to_string(obj_id: ObjectId) -> str:
+    return str(obj_id)
