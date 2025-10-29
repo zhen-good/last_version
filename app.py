@@ -15,6 +15,8 @@ from flask import Flask, render_template, request, jsonify, session
 from flask_socketio import SocketIO, emit, join_room
 from bson import ObjectId
 import bcrypt, string, random, os
+from friend import friends_bp
+from register import auth_bp
 
 
 
@@ -33,7 +35,6 @@ from convert_trip import convert_trip_to_prompt
 from optimizer import summarize_recommendations, ask_to_add_place, suggest_trip_modifications
 from place_util import get_opening_hours, search_places_by_tag
 from preference import update_user_preferences, extract_preferences_from_text
-from register_util import make_token, to_user_dto
 from weather_utils import get_weather, CITY_TRANSLATIONS
 from mongodb_utils import (
     user_collection,
@@ -71,6 +72,9 @@ def generate_trip_id(length=6):
 
 
 app = Flask(__name__)
+app.register_blueprint(friends_bp)
+app.register_blueprint(auth_bp)
+
 app.config["SECRET_KEY"] = "your_secret_key"
 socketio = SocketIO(
     app, 
@@ -81,61 +85,6 @@ socketio = SocketIO(
 )
 
 pending_recommendations = {}
-
-
-
-# ---------- 註冊、登入 ----------
-
-@app.route("/")
-def register_page():
-    return render_template("register.html")
-
-@app.route("/login_page")
-def login_page():
-    return render_template("login.html")
-
-@app.route("/register", methods=["POST"])
-def register():
-    data = request.get_json()
-    email = data.get("email")
-    password = data.get("password")
-    if not email or not password:
-        return jsonify({"detail": "請輸入完整資訊"}), 400
-    if user_collection.find_one({"email": email}):
-        return jsonify({"detail": "此 Email 已註冊"}), 409
-    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
-    user_collection.insert_one({"email": email, "password": hashed,"username":email})
-    return jsonify({"message": "註冊成功"})
-
-
-@app.route("/login", methods=["POST"])
-def login():
-
-    #這邊是在獲取前端的數據
-    data = request.get_json(force=True) or {}
-    email = data.get("email", "").strip()
-    password = data.get("password", "")
-    user = user_collection.find_one({"email": email})
-
-    if not user or not bcrypt.checkpw(password.encode(), user["password"]):
-        # 與前端慣例一致：401 + { "detail": "..." }
-        return jsonify({"detail": "帳號或密碼錯誤"}), 401
-
-    user_id = str(user["_id"])
-    token = make_token(user_id)
-
-    # 決定 redirect（可為 None）
-    trip_id = user.get("trip_id")
-    redirect_url = f"/chatroom/{trip_id}" if trip_id else None
-    msg = "登入成功" if trip_id else "登入成功，但未找到綁定行程"
-
-    # ⭐ 關鍵：不論情況，回傳**同一組欄位**
-    return jsonify({
-        "message": msg,
-        "user": to_user_dto(user),
-        "token": token,
-        "redirect": redirect_url
-    }), 200
 
 
 # ---------- 🧭 Trip Routes ----------
@@ -225,27 +174,31 @@ def handle_user_message(data):
     save_message_to_mongodb(trip_id,user_id, "user", raw_message)
 
     trip_id_ob = ObjectId(trip_id)
-    
-    try:
-        # 2. 發送給前端
-        emit("chat_message", {
-            "user_id": user_id,
-            "message": raw_message
-        }, room=trip_id)
-        print("這裡有錯嗎")
-    except Exception as e:
-        print(f"❌ Error emitting chat_message to client: {e}")
-    
-    # 呼叫你的 GPT 產生單題輸出
-    out = handle_extra_chat(user_id, trip_id, raw_message)  # 應回上面的單題 dict
 
-    print("確認題目格式：", out)
+    if raw_message != "分析":
+    
+        try:
+            # 2. 發送給前端
+            emit("chat_message", {
+                "user_id": user_id,
+                "message": raw_message
+            }, room=trip_id)
+            print("這裡有錯嗎")
+        except Exception as e:
+            print(f"❌ Error emitting chat_message to client: {e}")
+        
+        # 呼叫你的 GPT 產生單題輸出
+        out = handle_extra_chat(user_id, trip_id, raw_message)  # 應回上面的單題 dict
 
-    if(out):
-        print("成功")
-        emit_reply_and_question(user_id, trip_id, out)
-    else:
-        socketio.emit("ai_response", {"message": str(out)}, room=trip_id)
+        print("確認題目格式：", out)
+
+        if(out):
+            print("成功")
+            emit_reply_and_question(user_id, trip_id, out)
+        else:
+            socketio.emit("ai_response", {"message": str(out)}, room=trip_id)
+
+        return
 
     # emit("ai_response", {"message":raw_message}, room=trip_id)
 
@@ -276,6 +229,7 @@ def handle_user_message(data):
         return  # 🔚 結束本次處理
 
     # 1. 🔥 處理待新增景點的回覆
+
     if user_id in pending_add_location:
         place_to_add = pending_add_location[user_id]
         
@@ -520,7 +474,7 @@ def handle_user_message(data):
             if user_id in pending_add_location:
                 pending_add_location.pop(user_id)
                 
-            recommendations_list = analyze_active_users_preferences(user_chains, trip_id)
+            recommendations_list = analyze_active_users_preferences(user_chains, trip_id_ob)
             
             if recommendations_list:
                 pending_recommendations[user_id] = recommendations_list
@@ -633,7 +587,7 @@ def handle_user_message(data):
                 pending_add_location.pop(user_id)
                 
             print(f"✅ 已更新 {user_id} 的偏好：", prefs)
-            emit("ai_response", {"message": f"好的，已將您的偏好：{'、'.join(prefs['prefer'])} 加入考量，並避免 {'、'.join(prefs['avoid'])}。"}, room=trip_id)
+            # emit("ai_response", {"message": f"好的，已將您的偏好：{'、'.join(prefs['prefer'])} 加入考量，並避免 {'、'.join(prefs['avoid'])}。"}, room=trip_id)
             return  # 🚨 重要：處理完就直接返回
     except Exception as e:
         print(f"⚠️ 偏好擷取失敗：{e}")
@@ -687,7 +641,7 @@ def generate_recommendation_prompt(recommendation: dict) -> str:
     """
     rec_type = recommendation.get("type")
     day = recommendation.get("day")
-    ori_place = recommendation.get("ori_place")
+    ori_place = recommendation.get("place")
     # 支援 reason 可能是字串或物件（{summary, evidence, ...}）
     reason_obj = recommendation.get("reason") or {}
     reason_text = (

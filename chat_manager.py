@@ -75,6 +75,7 @@ def display_trip_by_trip_id(trip_id: ObjectId) -> str:
     根據新的 nodes 資料結構，將行程資料轉換為文字格式。
     """
     trip = trips_collection.find_one({"_id": trip_id})
+    print("trip的資料型態",type(trip))
 
     if not trip:
         return "❌ 查無行程"
@@ -199,20 +200,22 @@ def verify_alternative_places(alternative_places: list) -> list:
 
 # chat_manager.py 中修改後的 analyze_active_users_preferences 函式
 
-def analyze_active_users_preferences(user_chains: dict, trip_id: str) -> list:
+def analyze_active_users_preferences(user_chains: dict, trip_id_ob: ObjectId) -> list:
     """
     分析行程中所有使用者的偏好，並提供行程修改建議
     讓 AI 自動判斷旅遊地點，確保推薦同縣市的景點
     """
     try:
         # 取得行程資料
-        trip_text = display_trip_by_trip_id(trip_id)
+        trip_text = display_trip_by_trip_id(trip_id_ob)
         print("✅ trip_text:", trip_text)
         
         # 如果查無行程，立即返回空列表
         if "❌ 查無行程" in trip_text:
             print("❌ 找不到行程資料，無法進行分析")
             return []
+        
+        trip_id = str(trip_id_ob)
 
         # 載入相關偏好
         from preference import load_preferences_by_trip_id
